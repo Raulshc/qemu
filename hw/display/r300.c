@@ -40,8 +40,7 @@ static const struct {
     const char *name;
     uint16_t dev_id;
 } r300_model_aliases[] = {
-    { "radeon9500", PCI_DEVICE_ID_ATI_RADEON_9500_PRO },
-    { "radeon9700", PCI_DEVICE_ID_ATI_RADEON_9700 }
+    { "x550", PCI_DEVICE_ID_ATI_RADEON_X550 }
 };
 enum { VGA_MODE, EXT_MODE };
 
@@ -62,6 +61,77 @@ static void r300_vga_vblank_irq(void *opaque)
     s->regs.gen_int_status |= RADEON_CRTC_VBLANK_CUR ;
     r300_vga_update_irq(s);
 }
+
+static void r300_vga_switch_mode(RADVGAState *s)
+{
+  /* CRT controller enabled, use CRTC values */
+  /* FIXME Should these be the same as VGA CRTC regs? */
+  uint32_t offs = s->regs.crtc_offset & 0x07ffffff;
+  int stride = (s->regs.crtc_pitch & 0x7ff) * 8;
+  int bpp = 24;
+  int h, v;
+
+  if (s->regs.crtc_h_total_disp == 0) {
+      s->regs.crtc_h_total_disp = ((1024 / 8) - 1) << 16;
+  }
+  if (s->regs.crtc_v_total_disp == 0) {
+      s->regs.crtc_v_total_disp = (768 - 1) << 16;
+  }
+  h = ((s->regs.crtc_h_total_disp >> 16) + 1) * 8;
+  v = (s->regs.crtc_v_total_disp >> 16) + 1;
+  // qemu_log("Switching to %dx%d %d %d @ %x\n", h, v, stride, bpp, offs);
+  vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_ENABLE);
+  vbe_ioport_write_data(&s->vga, 0, VBE_DISPI_DISABLED);
+  /* reset VBE regs then set up mode */
+  s->vga.vbe_regs[VBE_DISPI_INDEX_XRES] = h;
+  s->vga.vbe_regs[VBE_DISPI_INDEX_YRES] = v;
+  s->vga.vbe_regs[VBE_DISPI_INDEX_BPP] = bpp;
+  /* enable mode via ioport so it updates vga regs */
+  vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_ENABLE);
+  vbe_ioport_write_data(&s->vga, 0, VBE_DISPI_ENABLED |
+      VBE_DISPI_LFB_ENABLED | VBE_DISPI_NOCLEARMEM |
+      (s->regs.dac_cntl & RADEON_DAC_8BIT_EN ? VBE_DISPI_8BIT_DAC : 0));
+  /* now set offset and stride after enable as that resets these */
+  if (stride) {
+      int bypp = DIV_ROUND_UP(bpp, BITS_PER_BYTE);
+
+      vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_VIRT_WIDTH);
+      vbe_ioport_write_data(&s->vga, 0, stride);
+      stride *= bypp;
+      if (offs % stride) {
+          // qemu_log("CRTC offset is not multiple of pitch\n");
+          vbe_ioport_write_index(&s->vga, 0,
+                                 VBE_DISPI_INDEX_X_OFFSET);
+          vbe_ioport_write_data(&s->vga, 0, offs % stride / bypp);
+      }
+      vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_Y_OFFSET);
+      vbe_ioport_write_data(&s->vga, 0, offs / stride);
+      // qemu_log("VBE offset (%d,%d), vbe_start_addr=%x\n",
+      //         s->vga.vbe_regs[VBE_DISPI_INDEX_X_OFFSET],
+      //         s->vga.vbe_regs[VBE_DISPI_INDEX_Y_OFFSET],
+      //         s->vga.vbe_start_addr);
+  }
+}
+
+static uint64_t r300_i2c(bitbang_i2c_interface *i2c, uint64_t data, int base)
+{
+    bool c = (data & BIT(base + 17) ? !!(data & BIT(base + 1)) : 1);
+    bool d = (data & BIT(base + 16) ? !!(data & BIT(base)) : 1);
+
+    bitbang_i2c_set(i2c, BITBANG_I2C_SCL, c);
+    d = bitbang_i2c_set(i2c, BITBANG_I2C_SDA, d);
+
+    data &= ~0xf00ULL;
+    if (c) {
+        data |= BIT(base + 9);
+    }
+    if (d) {
+        data |= BIT(base + 8);
+    }
+    return data;
+}
+
+
 
 static inline uint64_t r300_reg_read_offs(uint32_t reg, int offs,
                                          unsigned int size)
@@ -141,24 +211,28 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
         val = s->regs.gen_int_status;
         break;
     case RADEON_CRTC_GEN_CNTL:
-          val = vga_ioport_read(s,addr);
-        break;
     case RADEON_CRTC_EXT_CNTL:
-    val = vga_ioport_read(s,addr);
+    r300_vga_switch_mode(s);
     break;
     case RADEON_GPIO_VGA_DDC:
 
-        val = s->regs.gpio_vga_ddc;
+        // val = s->regs.gpio_vga_ddc;
+        // qemu_log("READ VGA DDC %lx \n",val);
+        // r300_i2c(&s->bbi2c,s->regs.gpio_vga_ddc,0);
+        // r300_vga_switch_mode(s);
         break;
     case RADEON_GPIO_DVI_DDC:
-      val = s->regs.gpio_dvi_ddc;
+      val = r300_i2c(&s->bbi2c,s->regs.gpio_dvi_ddc,0);
+      // qemu_log("READ DVI DDC %lx \n",val);
+      // r300_vga_switch_mode(s);
+
       break;
     case RADEON_CONFIG_CNTL:
         val = s->regs.config_cntl;
         break;
     case RADEON_CONFIG_MEMSIZE:
         val = s->vga.vram_size;
-        qemu_log("RADEON_MEMSIZE %ld \n",val);
+
         break;
     case RADEON_CONFIG_APER_SIZE:
         val = s->vga.vram_size;
@@ -381,10 +455,10 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
                 val = s->regs.crtc2_gen_cntl;
                 break;
                 case RADEON_AGP_BASE_2:
-                val = s->regs.agp_base_2;
+                // val = s->regs.agp_base_2;
                 break;
                 case RADEON_AGP_BASE:
-                val = s->regs.agp_base;
+                // val = s->regs.agp_base;
                 break;
                 case RADEON_MEM_ADDR_CONFIG:
                 val = s->regs.mem_addr_config;
@@ -437,6 +511,7 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
                     break;
                     case RADEON_AIC_CNTL:
                     val = s->regs.aic_cntl;
+                    qemu_log("READ AIC_CNTL 0x%08lx \n",val);
                     break;
                     case RADEON_AIC_PT_BASE:
                     val = s->regs.aic_pt_base;
@@ -444,9 +519,9 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
                     break;
 
                     case RADEON_PCI_GART_PAGE:
-                    qemu_log("READ GART \n");
+
                     val = s->regs.pci_gart_page;
-                    qemu_log("GART REGISTER 0x%08lx CONTAINS 0x%08lx \n",addr,val);
+                    // qemu_log("GART REGISTER 0x%08lx CONTAINS 0x%08lx \n",addr,val);
                     break;
                     case RADEON_MC_AGP_LOCATION:
                     val = s->regs.mc_agp_location;
@@ -459,10 +534,12 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
                     val = s->regs.pcie_data;
                     break;
                     case RADEON_AIC_LO_ADDR:
-                    val = s->regs.aic_lo_addr;
+                    val = memory_region_get_ram_addr(&s->gart);
+                    qemu_log("READ GART START 0x%08lx \n",val);
                     break;
                     case RADEON_AIC_HI_ADDR:
-                    val = s->regs.aic_hi_addr;
+                    val = memory_region_get_ram_addr(&s->gart)+(512*MiB);
+                    qemu_log("READ GART END 0x%08lx \n",val);
                     break;
                     case RADEON_FP_GEN_CNTL:
                     val = s->regs.fp_gen_cntl;
@@ -471,7 +548,7 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
 
                     break;
                     case RADEON_DEVICE_ID:
-                    val = PCI_DEVICE_ID_ATI_RADEON_9500_PRO;
+                    val = PCI_DEVICE_ID_ATI_RADEON_X550;
                     break;
                     case RADEON_DAC_CNTL:
                     case RADEON_DAC_CNTL2:
@@ -492,8 +569,43 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
                     case RADEON_MDGPIO_EN:
                     case RADEON_MDGPIO_Y:
                     case RADEON_DISP_OUTPUT_CNTL:
-                        val = vga_ioport_read(s,addr);
+                        r300_vga_switch_mode(s);
                     break;
+                    case RADEON_GRPH_BUFFER_CNTL:
+                    break;
+                    case RADEON_MEM_TIMING_CNTL:
+                    val = 0xdeadbeef;
+                    break;
+                    case RADEON_MEM_SDRAM_MODE_REG:
+                    break;
+                    case RADEON_FP_HORZ_STRETCH:
+                    break;
+                    case RADEON_FP_VERT_STRETCH:
+                    break;
+                    case RADEON_CRTC_MORE_CNTL:
+                    break;
+                    case RADEON_FP_HORZ_VERT_ACTIVE:
+                    break;
+                    case RADEON_FP_H_SYNC_STRT_WID:
+                    break;
+                    case RADEON_FP_V_SYNC_STRT_WID:
+                    break;
+                    case RADEON_FP_CRTC_H_TOTAL_DISP:
+                    break;
+                    case RADEON_FP_CRTC_V_TOTAL_DISP:
+                    break;
+                    case RADEON_TMDS_PLL_CNTL:
+                    break;
+                    case RADEON_TMDS_TRANSMITTER_CNTL:
+                    break;
+                    case RADEON_DISP_MERGE_CNTL:
+                    case RADEON_CRTC_CRNT_FRAME:
+                    case RADEON_CRTC_VLINE_CRNT_VLINE:
+                    case RADEON_CRTC_STATUS:
+                    r300_vga_switch_mode(s);
+                    break;
+
+
 
 
 
@@ -508,8 +620,8 @@ static uint64_t r300_mm_read(void *opaque, hwaddr addr, unsigned int size)
 
     default:
         qemu_log("READING FROM 0x%08lx \n",addr);
-        val = s->regs.emu_register_stub[addr % 1024];
-        qemu_log("REGISTER 0x%08lx CONTAINS 0x%08lx \n",addr,val);
+        // val = s->regs.emu_register_stub[addr % 1024];
+        // qemu_log("REGISTER 0x%08lx CONTAINS 0x%08lx \n",addr,val);
         break;
     }
     if (addr < RADEON_CUR_OFFSET || addr > RADEON_CUR_CLR1 || R300_DEBUG_HW_CURSOR) {
@@ -535,6 +647,8 @@ static void r300_mm_write(void *opaque, hwaddr addr,
 {
     RADVGAState *s = opaque;
 
+      // qemu_log("REGISTER 0x%08lx, VALUE 0x%08lx \n",addr,data);
+
     // qemu_log("R300 MM_WRITE ADDRESS 0x%08lx DATA 0x%08lx \n",addr,data);
 
     if (addr < RADEON_CUR_OFFSET || addr > RADEON_CUR_CLR1 || R300_DEBUG_HW_CURSOR) {
@@ -555,7 +669,7 @@ static void r300_mm_write(void *opaque, hwaddr addr,
               break;
 
       case RADEON_MC_STATUS:
-        qemu_log("RADEON_WRITE_MC \n");
+
         s->regs.mc_status = R300_MC_IDLE;
         s->regs.mc_status = data;
         break;
@@ -630,31 +744,62 @@ static void r300_mm_write(void *opaque, hwaddr addr,
         break;
     case RADEON_CRTC_GEN_CNTL:
     {
-      // qemu_log("RADEON_WRITE_CRTC_GEN \n");
+
       s->regs.crtc_gen_cntl = data;
-      vga_ioport_write(s,addr,data);
+      // r300_vga_switch_mode(s);
         break;
     }
     case RADEON_CRTC_EXT_CNTL:
     {
-      vga_ioport_write(s,addr,data);
+
+        s->regs.crtc_ext_cntl = data;
+        // r300_vga_switch_mode(s);
         break;
     }
+    case RADEON_CRTC_OFFSET:
+         s->regs.crtc_offset= data;
+        break;
+    case RADEON_CRTC_OFFSET_CNTL:
+        s->regs.crtc_offset_cntl = data;
+        break;
+    case RADEON_CRTC_PITCH:
+        s->regs.crtc_pitch = data;
+        break;
+        case RADEON_CRTC_H_TOTAL_DISP:
+            s->regs.crtc_h_total_disp= data;
+            break;
+        case RADEON_CRTC_H_SYNC_STRT_WID:
+            s->regs.crtc_h_sync_strt_wid = data;
+            break;
+        case RADEON_CRTC_V_TOTAL_DISP:
+            s->regs.crtc_v_total_disp= data;
+            break;
     case RADEON_GPIO_VGA_DDC:
         s->regs.gpio_vga_ddc = data;
+
+        // r300_vga_switch_mode(s);
         break;
     case RADEON_GPIO_DVI_DDC:
             s->regs.gpio_dvi_ddc = data;
+            // qemu_log(" WRITE DVI DDC %lx \n",data);
+            // r300_i2c(&s->bbi2c,data,0);
+            // r300_vga_switch_mode(s);
+
 
         break;
     case RADEON_GPIO_MONID:
 
         s->regs.gpio_monid = data;
+        // r300_vga_switch_mode(s);
         break;
-    case RADEON_PALETTE_INDEX ... RADEON_PALETTE_INDEX + 3:
+    case RADEON_PALETTE_INDEX:
 
+        vga_ioport_write(&s->vga, VGA_PEL_IR, (data >> 16) & 0xff);
+        vga_ioport_write(&s->vga, VGA_PEL_IW, data & 0xff);
         break;
-    case RADEON_PALETTE_DATA ... RADEON_PALETTE_DATA + 3:
+    case RADEON_PALETTE_DATA:
+
+        vga_ioport_write(&s->vga, VGA_PEL_D, data & 0xff);
         break;
     case RADEON_CONFIG_CNTL:
         s->regs.config_cntl = data;
@@ -783,15 +928,17 @@ static void r300_mm_write(void *opaque, hwaddr addr,
   break;
   case RADEON_CRTC2_GEN_CNTL:
   s->regs.crtc2_gen_cntl = data;
+
+  // r300_vga_switch_mode(s);
   break;
   // case RADEON_MEM_INTF_CNTL:
   // s->regs.mem_intf_cntl = data;
   // break;
   case RADEON_AGP_BASE_2:
-  s->regs.agp_base_2 = data;
+  // s->regs.agp_base_2 = data;
   break;
   case RADEON_AGP_BASE:
-  s->regs.agp_base = data;
+  // s->regs.agp_base = data;
   break;
   case RADEON_MEM_ADDR_CONFIG:
   s->regs.mem_addr_config = data;
@@ -816,10 +963,12 @@ static void r300_mm_write(void *opaque, hwaddr addr,
 
   break;
   case R300_MC_INIT_MISC_LAT_TIMER:
-  s->regs.r300_mc_init_misc_lat_timer = 0xDEADBEEF;
+  s->regs.r300_mc_init_misc_lat_timer = data;
   break;
   case RADEON_AIC_CNTL:
   s->regs.aic_cntl = data;
+  qemu_log("AIC_CNTL 0x%08lx \n",s->regs.aic_cntl);
+
   break;
   case RADEON_DDA_CONFIG:
   s->regs.dda_config = data;
@@ -844,18 +993,21 @@ static void r300_mm_write(void *opaque, hwaddr addr,
 				      RADEON_SCLK_FORCE_OV0);
   break;
   case RADEON_PCI_GART_PAGE:
-  qemu_log("WRITE GART \n");
+
   s->regs.pci_gart_page = data;
-  qemu_log("REGISTER 0x%08lx CONTAINS 0x%08lx \n",addr,data);
+
   break;
   case RADEON_AIC_PT_BASE:
-  qemu_log("R100 GART ADDR 0x%08lx GART PTR 0x%08lx \n",addr,data);
+
   s->regs.aic_pt_base = data;
+  // address_space_init(&s->gart_as,MEMORY_REGION(&s->gart),"ati-dma");
+  memory_region_set_address(&s->gart,s->regs.aic_pt_base);
+
 
   break;
   case RADEON_MC_AGP_LOCATION:
   s->regs.mc_agp_location = data;
-  qemu_log("WRITE MC_AGP  ADDR 0x%08lx DATA 0x%08lx \n",addr,data);
+
   break;
   case RADEON_PCIE_INDEX:
   s->regs.pcie_index = data;
@@ -864,10 +1016,12 @@ static void r300_mm_write(void *opaque, hwaddr addr,
   s->regs.pcie_data = data;
   break;
   case RADEON_AIC_LO_ADDR:
-  s->regs.aic_lo_addr=data;
+    s->regs.aic_lo_addr=data;
+    qemu_log("GART_BEGIN 0x%08lx \n",data);
   break;
   case RADEON_AIC_HI_ADDR:
-  s->regs.aic_hi_addr=data;
+    s->regs.aic_hi_addr=data;
+    qemu_log("GART_END 0x%08lx \n",data);
   break;
   case RADEON_FP_GEN_CNTL:
   s->regs.fp_gen_cntl = data;
@@ -889,10 +1043,35 @@ static void r300_mm_write(void *opaque, hwaddr addr,
   case RADEON_DAC_W_INDEX:
   case RADEON_DAC_EXT_CNTL:
   case RADEON_DISP_OUTPUT_CNTL:
-    if(data > 0)
-    qemu_log("DAC/DISPLAY ADDR %lx DATA %lx \n",addr,data);
-    vga_ioport_write(s,addr,data);
+    // if(data > 0)
+    // qemu_log("DAC/DISPLAY ADDR %lx DATA %lx \n",addr,data);
+    // r300_vga_switch_mode(s);
   break;
+
+
+  case RADEON_CRTC_V_SYNC_STRT_WID:
+  break;
+  case RADEON_FP_HORZ_STRETCH:
+  break;
+  case RADEON_FP_VERT_STRETCH:
+  break;
+  case RADEON_CRTC_MORE_CNTL:
+  break;
+  case RADEON_FP_HORZ_VERT_ACTIVE:
+  break;
+  case RADEON_FP_H_SYNC_STRT_WID:
+  break;
+  case RADEON_FP_V_SYNC_STRT_WID:
+  break;
+  case RADEON_FP_CRTC_H_TOTAL_DISP:
+  break;
+  case RADEON_FP_CRTC_V_TOTAL_DISP:
+  break;
+  case RADEON_TMDS_PLL_CNTL:
+  break;
+  case RADEON_TMDS_TRANSMITTER_CNTL:
+  break;
+
 
   case RADEON_GPIOPAD_MASK:
   case RADEON_GPIOPAD_A:
@@ -904,6 +1083,22 @@ static void r300_mm_write(void *opaque, hwaddr addr,
   case RADEON_MDGPIO_Y:
 
   break;
+  case RADEON_GRPH_BUFFER_CNTL:
+  break;
+  case RADEON_MEM_TIMING_CNTL:
+  break;
+  case RADEON_MEM_SDRAM_MODE_REG:
+  break;
+  case RADEON_DISP_MERGE_CNTL:
+  break;
+ case RADEON_OVR_CLR:
+case RADEON_OVR_WID_LEFT_RIGHT:
+case RADEON_OVR_WID_TOP_BOTTOM:
+break;
+case RADEON_PALETTE_30_DATA:
+break;
+
+
 
 
 
@@ -917,7 +1112,7 @@ static void r300_mm_write(void *opaque, hwaddr addr,
 
     default:
     qemu_log("REGISTER NOT IMPLEMENTED 0x%08lx \n",addr);
-    s->regs.emu_register_stub[addr % 1024] = data;
+    // s->regs.emu_register_stub[addr % 1024] = data;
     // qemu_log("REGISTER NOT IMPLEMENTED INDEX 0x%08lx \n",addr % 1024);
     qemu_log("REGISTER NOT IMPLEMENTED DATA 0x%08lx \n",data);
 
@@ -925,24 +1120,24 @@ static void r300_mm_write(void *opaque, hwaddr addr,
     }
 
 }
-static void r300_gart_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size){
-  qemu_log("GART_WRITE 0x%08lx \n",addr);
-}
-static uint64_t r300_gart_read(void *opaque, hwaddr addr, unsigned int size){
-  qemu_log("GART_READ 0x%08lx \n",addr);
-  return 0;
-}
+// static void r300_gart_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size){
+//   qemu_log("GART_WRITE 0x%08lx \n",addr);
+// }
+// static uint64_t r300_gart_read(void *opaque, hwaddr addr, unsigned int size){
+//   qemu_log("GART_READ 0x%08lx \n",addr);
+//   return 0;
+// }
 
 static const MemoryRegionOps r300_mm_ops = {
     .read = r300_mm_read,
     .write = r300_mm_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
-static const MemoryRegionOps r300_gart_ops = {
-  .read = r300_gart_read,
-  .write = r300_gart_write,
-  .endianness = DEVICE_LITTLE_ENDIAN,
-};
+// static const MemoryRegionOps r300_gart_ops = {
+//   .read = r300_gart_read,
+//   .write = r300_gart_write,
+//   .endianness = DEVICE_LITTLE_ENDIAN,
+// };
 
 
 
@@ -981,17 +1176,17 @@ static void r300_vga_realize(PCIDevice *dev, Error **errp)
                         "using default radeon9500");
         }
     }
-    if (s->dev_id != PCI_DEVICE_ID_ATI_RADEON_9500_PRO) {
+    if (s->dev_id != PCI_DEVICE_ID_ATI_RADEON_X550) {
         error_setg(errp, "Unknown ATI VGA device id, "
                    "only 0x4e45 is supported");
         return;
     }
     pci_set_word(dev->config + PCI_DEVICE_ID, s->dev_id);
 
-    if (s->dev_id == PCI_DEVICE_ID_ATI_RADEON_9500_PRO &&
-        s->vga.vram_size_mb < 128) {
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RADEON_X550 &&
+        s->vga.vram_size_mb < 256) {
         warn_report("Too small video memory for device id");
-        s->vga.vram_size_mb = 128;
+        s->vga.vram_size_mb = 256;
     }
 
     /* init vga bits */
@@ -1000,6 +1195,13 @@ static void r300_vga_realize(PCIDevice *dev, Error **errp)
              pci_address_space_io(dev), true);
     vga->con = graphic_console_init(DEVICE(s), 0, s->vga.hw_ops, &s->vga);
 
+    /* ddc, edid */
+    I2CBus *i2cbus = i2c_init_bus(DEVICE(s), "ati-vga.ddc");
+    bitbang_i2c_init(&s->bbi2c, i2cbus);
+    I2CSlave *i2cddc = I2C_SLAVE(qdev_create(BUS(i2cbus), TYPE_I2CDDC));
+    i2c_set_slave_address(i2cddc, 0x50);
+
+    memory_region_init_ram(&s->vram,OBJECT(s),"ati.vram",s->vga.vram_size_mb * MiB,&error_fatal);
     /* mmio register space */
     memory_region_init_io(&s->mm, OBJECT(s), &r300_mm_ops, s,"ati.mmregs", RADEON_MIN_MMIO_SIZE);
     /* io space is alias to beginning of mmregs */
@@ -1007,14 +1209,13 @@ static void r300_vga_realize(PCIDevice *dev, Error **errp)
     /* GART address space */
     // memory_region_init_iommu(&s->gart,sizeof(&s->gart),TYPE_AMD_IOMMU_MEMORY_REGION,OBJECT(s),"ati.gart",1 * GiB);
     // address_space_init(&s->gart_as,MEMORY_REGION(&s->gart),"ati-dma");
-    memory_region_init_io(&s->gart,OBJECT(s),&r300_gart_ops,s,"ati.gart",RADEON_MIN_MMIO_SIZE);
-    // memory_region_init_alias(&s->gart,OBJECT(s),"ati.gart",&s->mm,RADEON_PCI_GART_PAGE,RADEON_MIN_MMIO_SIZE);
+    memory_region_init_ram(&s->gart,OBJECT(s),"ati.gart",512 * MiB,&error_fatal);
 
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &vga->vram);
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mm);
-    pci_register_bar(dev,3, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->gart);
+    // pci_register_bar(dev,3, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->gart);
 
 
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, r300_vga_vblank_irq, s);
@@ -1042,11 +1243,11 @@ static void r300_vga_exit(PCIDevice *dev)
 }
 
 static Property r300_vga_properties[] = {
-    DEFINE_PROP_UINT32("vgamem_mb", RADVGAState, vga.vram_size_mb, 1024),
+    DEFINE_PROP_UINT32("vgamem_mb", RADVGAState, vga.vram_size_mb, 256),
     DEFINE_PROP_STRING("model", RADVGAState, model),
     DEFINE_PROP_UINT16("x-device-id", RADVGAState, dev_id,
-                       PCI_DEVICE_ID_ATI_RADEON_9500_PRO),
-    DEFINE_PROP_BOOL("guest_hwcursor", RADVGAState, cursor_guest_mode, false),
+                       PCI_DEVICE_ID_ATI_RADEON_X550),
+    // DEFINE_PROP_BOOL("guest_hwcursor", RADVGAState, cursor_guest_mode, false),
     DEFINE_PROP_END_OF_LIST()
 };
 
@@ -1062,8 +1263,8 @@ static void r300_vga_class_init(ObjectClass *klass, void *data)
 
     k->class_id = PCI_CLASS_DISPLAY_VGA;
     k->vendor_id = PCI_VENDOR_ID_ATI;
-    k->device_id = PCI_DEVICE_ID_ATI_RADEON_9500_PRO;
-    k->romfile = "vgabios-ati.bin";
+    k->device_id = PCI_DEVICE_ID_ATI_RADEON_X550;
+    k->romfile = "vgabios-r300.bin";
     k->realize = r300_vga_realize;
     k->exit = r300_vga_exit;
 }

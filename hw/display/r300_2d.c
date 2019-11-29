@@ -37,7 +37,7 @@ static int r300_bpp_from_datatype(RADVGAState *s)
     case 6:
         return 32;
     default:
-        qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %d\n",
+        qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %ld\n",
                       s->regs.dp_datatype & 0xf);
         return 0;
     }
@@ -50,7 +50,7 @@ void r300_2d_blt(RADVGAState *s)
     /* FIXME it is probably more complex than this and may need to be */
     /* rewritten but for now as a start just to get some output: */
     DisplaySurface *ds = qemu_console_surface(s->vga.con);
-    DPRINTF("%p %u ds: %p %d %d rop: %x\n", s->vga.vram_ptr,
+    qemu_log("%p %u ds: %p %d %d rop: %lx\n", s->vga.vram_ptr,
             s->vga.vbe_start_addr, surface_data(ds), surface_stride(ds),
             surface_bits_per_pixel(ds),
             (s->regs.dp_mix & RADEON_GMC_ROP3_MASK) >> 16);
@@ -73,7 +73,7 @@ void r300_2d_blt(RADVGAState *s)
         qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented\n");
         return;
     }
-    DPRINTF("%d %d %d, %d %d %d, (%d,%d) -> (%d,%d) %dx%d %c %c\n",
+    qemu_log("%ld %ld %ld, %ld %ld %ld, (%ld,%ld) -> (%ld,%ld) %ldx%ld %c %c\n",
             s->regs.src_offset, s->regs.dst_offset, s->regs.default_offset,
             s->regs.src_pitch, s->regs.dst_pitch, s->regs.default_pitch,
             s->regs.src_x, s->regs.src_y, s->regs.dst_x, s->regs.dst_y,
@@ -102,9 +102,9 @@ void r300_2d_blt(RADVGAState *s)
             return;
         }
 
-        src_stride /= sizeof(uint32_t);
-        dst_stride /= sizeof(uint32_t);
-        DPRINTF("pixman_blt(%p, %p, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d)\n",
+        src_stride /= sizeof(uint64_t);
+        dst_stride /= sizeof(uint64_t);
+        qemu_log("pixman_blt(%p, %p, %d, %d, %d, %d, %d, %d, %d, %d, %ld, %ld)\n",
                 src_bits, dst_bits, src_stride, dst_stride, bpp, bpp,
                 src_x, src_y, dst_x, dst_y,
                 s->regs.dst_width, s->regs.dst_height);
@@ -117,8 +117,8 @@ void r300_2d_blt(RADVGAState *s)
         } else {
             /* FIXME: We only really need a temporary if src and dst overlap */
             int llb = s->regs.dst_width * (bpp / 8);
-            int tmp_stride = DIV_ROUND_UP(llb, sizeof(uint32_t));
-            uint32_t *tmp = g_malloc(tmp_stride * sizeof(uint32_t) *
+            int tmp_stride = DIV_ROUND_UP(llb, sizeof(uint64_t));
+            uint32_t *tmp = g_malloc(tmp_stride * sizeof(uint64_t) *
                                      s->regs.dst_height);
             pixman_blt((uint32_t *)src_bits, tmp,
                        src_stride, tmp_stride, bpp, bpp,
@@ -146,7 +146,7 @@ void r300_2d_blt(RADVGAState *s)
     case RADEON_ROP3_ZERO:
     case RADEON_ROP3_ONE:
     {
-        uint32_t filler = 0;
+        uint64_t filler = 0;
 
         switch (s->regs.dp_mix & RADEON_GMC_ROP3_MASK) {
         case RADEON_ROP3_P:
@@ -162,8 +162,8 @@ void r300_2d_blt(RADVGAState *s)
             break;
         }
 
-        dst_stride /= sizeof(uint32_t);
-        DPRINTF("pixman_fill(%p, %d, %d, %d, %d, %d, %d, %x)\n",
+        dst_stride /= sizeof(uint64_t);
+        qemu_log("pixman_fill(%p, %d, %d, %ld, %ld, %ld, %ld, %lx)\n",
                 dst_bits, dst_stride, bpp,
                 s->regs.dst_x, s->regs.dst_y,
                 s->regs.dst_width, s->regs.dst_height,
@@ -184,7 +184,7 @@ void r300_2d_blt(RADVGAState *s)
         break;
     }
     default:
-        qemu_log_mask(LOG_UNIMP, "Unimplemented r300_2d blt op %x\n",
+        qemu_log_mask(LOG_UNIMP, "Unimplemented r300_2d blt op %lx\n",
                       (s->regs.dp_mix & RADEON_GMC_ROP3_MASK) >> 16);
     }
 }
